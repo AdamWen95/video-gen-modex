@@ -16,6 +16,8 @@ import gradio as gr
 import requests
 from dotenv import load_dotenv
 
+from video_download import DownloadCache, DownloadError
+
 
 APP_DIR = Path(__file__).resolve().parent
 POLL_INTERVAL_SECONDS = 5
@@ -24,6 +26,8 @@ REQUEST_TIMEOUT = (10, 60)  # Connect timeout, read timeout.
 UPLOAD_NOTICE = "当前接口示例需要公网 URL；如果不能直接传文件，请先保留 image_url 方式"
 SUCCESS_STATUSES = {"completed", "complete", "succeeded", "success", "done", "finished"}
 FAILURE_STATUSES = {"failed", "failure", "error", "cancelled", "canceled", "rejected", "expired"}
+VIDEO_CACHE = DownloadCache(APP_DIR / "output" / "videos")
+DOWNLOAD_NOTICE = "取得视频后会自动准备本地下载；首次准备的速度取决于视频源站。"
 
 
 @dataclass(frozen=True)
@@ -395,7 +399,7 @@ def video_html(video_url: str | None) -> str:
         return '<div style="padding:3rem;text-align:center;color:#777">生成的视频将在这里显示</div>'
     source = html.escape(validate_url(video_url, "视频 URL"), quote=True)
     return (
-        f'<video controls playsinline preload="metadata" src="{source}" '
+        f'<video controls controlslist="nodownload" playsinline preload="none" src="{source}" '
         'style="width:100%;max-height:480px;border-radius:8px;background:#111">'
         '浏览器无法播放此视频，请复制下方视频 URL 打开。</video>'
     )
@@ -404,21 +408,52 @@ def video_html(video_url: str | None) -> str:
 def generate_video_for_ui(
     model: str, mode: str, prompt: str, image_url: str, image_upload: str | None,
     width: Any, height: Any, duration: Any, seed: Any,
-) -> Iterator[tuple[str, str, Any, str]]:
+) -> Iterator[tuple]:
     for status, url, response, link in generate_video(
         model, mode, prompt, image_url, image_upload, width, height, duration, seed,
     ):
-        yield status, video_html(url), response, link
+        yield status, video_html(url), response, link, gr.DownloadButton(value=None, interactive=False), DOWNLOAD_NOTICE, link
 
 
-def query_existing_task_for_ui(task_id: str) -> Iterator[tuple[str, str, Any, str]]:
+def query_existing_task_for_ui(task_id: str) -> Iterator[tuple]:
     for status, url, response, link in query_existing_task(task_id):
-        yield status, video_html(url), response, link
+        yield status, video_html(url), response, link, gr.DownloadButton(value=None, interactive=False), DOWNLOAD_NOTICE, link
+
+
+def prepare_video_download(video_url: str) -> Iterator[tuple[str, Any]]:
+    """Observe a background download; cancellation never blocks on the CDN."""
+    yield DOWNLOAD_NOTICE, gr.DownloadButton(value=None, interactive=False)
+    if not video_url:
+        return
+    try:
+        job = VIDEO_CACHE.get(validate_url(video_url, "视频 URL"))
+        started = time.monotonic()
+        initial_bytes = job.progress.downloaded
+        previous_bytes = initial_bytes
+        while not job.future.done():
+            state = job.progress
+            if state.downloaded < previous_bytes:
+                started = time.monotonic()
+                initial_bytes = state.downloaded
+            previous_bytes = state.downloaded
+            downloaded = state.downloaded / 1024**2
+            total = f" / {state.total / 1024**2:.1f} MiB" if state.total else " MiB"
+            elapsed = max(time.monotonic() - started, 0.1)
+            speed = max(0, state.downloaded - initial_bytes) / elapsed / 1024
+            message = f"{state.mode} · {downloaded:.1f}{total} · {speed:.0f} KiB/s"
+            yield message, gr.skip()
+            time.sleep(0.5)
+        path = job.future.result()
+        size = path.stat().st_size / 1024**2
+        yield f"已准备好 · {size:.1f} MiB · 点击“下载视频”从本地缓存保存。", gr.DownloadButton(value=str(path), interactive=True)
+    except (DownloadError, ValueError, OSError) as exc:
+        yield f"下载准备失败：{exc} 可点击“重试下载”，或复制视频 URL 直接下载。", gr.DownloadButton(value=None, interactive=False)
 
 
 def build_app() -> gr.Blocks:
     settings = load_settings()
     with gr.Blocks(title="Modex · Seedance 视频生成", analytics_enabled=False) as demo:
+        download_url = gr.State("")
         gr.Markdown("# Modex · Seedance 视频生成\n输入画面描述，生成一段视频。支持文生视频与图片 URL 图生视频。")
         with gr.Row():
             with gr.Column(scale=1):
@@ -444,23 +479,41 @@ def build_app() -> gr.Blocks:
                 status = gr.Textbox(label="任务状态", value="就绪 · 填写参数后提交", lines=5, interactive=False)
                 gr.Markdown("### 视频结果")
                 video = gr.HTML(value=video_html(None))
+                with gr.Row():
+                    download = gr.DownloadButton("下载视频（本地缓存）", interactive=False, variant="primary")
+                    retry_download = gr.Button("重试下载", size="sm")
+                download_status = gr.Textbox(label="下载进度", value=DOWNLOAD_NOTICE, interactive=False)
                 result_url = gr.Textbox(label="视频 URL（播放器无法播放时可复制打开）", interactive=False)
                 with gr.Accordion("接口响应（提交及轮询记录）", open=True):
                     raw_response = gr.JSON(label="响应 JSON", value=[])
         mode.change(lambda value: gr.Group(visible=value == "image2video"), inputs=mode, outputs=image_fields, queue=False)
+        download_event = gr.on(
+            triggers=[result_url.change, retry_download.click],
+            fn=prepare_video_download,
+            inputs=download_url,
+            outputs=[download_status, download],
+            trigger_mode="always_last",
+            concurrency_limit=2,
+            show_progress="hidden",
+            api_name=False,
+        )
         submit.click(
             fn=generate_video_for_ui,
             inputs=[model, mode, prompt, image_url, image_upload, width, height, duration, seed],
-            outputs=[status, video, raw_response, result_url],
+            outputs=[status, video, raw_response, result_url, download, download_status, download_url],
+            cancels=[download_event],
             concurrency_limit=1,
+            concurrency_id="modex_tasks",
             trigger_mode="once",
             api_name=False,
         )
         query.click(
             fn=query_existing_task_for_ui,
             inputs=existing_task_id,
-            outputs=[status, video, raw_response, result_url],
+            outputs=[status, video, raw_response, result_url, download, download_status, download_url],
+            cancels=[download_event],
             concurrency_limit=1,
+            concurrency_id="modex_tasks",
             trigger_mode="once",
             api_name=False,
         )

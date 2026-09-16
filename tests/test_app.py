@@ -3,9 +3,12 @@
 import io
 import json
 import unittest
+from concurrent.futures import Future
 from contextlib import ExitStack, redirect_stdout
 from html.parser import HTMLParser
 from unittest.mock import Mock, patch
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import requests
 
@@ -432,10 +435,13 @@ class ClientTests(unittest.TestCase):
         ])):
             updates = list(app.generate_video_for_ui(**PARAMETERS))
 
-        status, markup, response, link = updates[-1]
+        status, markup, response, link, download, download_status, download_url = updates[-1]
         self.assertEqual(status, "生成完成")
         self.assertEqual(response, history)
         self.assertEqual(link, url)
+        self.assertEqual(download_url, url)
+        self.assertIsNone(download.value)
+        self.assertFalse(download.interactive)
 
         class VideoParser(HTMLParser):
             def __init__(self):
@@ -455,6 +461,38 @@ class ClientTests(unittest.TestCase):
         self.assertIn("&lt;script&gt;", markup)
         self.assertEqual(app.gr.HTML(render=False).postprocess(markup), markup)
         self.session.request.assert_not_called()
+
+    def test_download_returns_local_file_and_does_not_use_modex_session(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "video.mp4"
+            path.write_bytes(b"video bytes")
+            future = Future()
+            future.set_result(path)
+            job = Mock(future=future)
+            job.progress.downloaded = len(b"video bytes")
+            with patch.object(app.VIDEO_CACHE, "get", return_value=job) as get:
+                updates = list(app.prepare_video_download(VIDEO_URL))
+            get.assert_called_once_with(VIDEO_URL)
+            message, button = updates[-1]
+            self.assertIn("已准备好", message)
+            self.assertEqual(Path(button.value["path"]).read_bytes(), path.read_bytes())
+            self.assertTrue(button.interactive)
+        self.session.request.assert_not_called()
+
+    def test_download_failure_keeps_button_disabled_and_offers_retry(self):
+        with patch.object(app.VIDEO_CACHE, "get", side_effect=app.DownloadError("源站连接超时")):
+            updates = list(app.prepare_video_download(VIDEO_URL))
+        self.assertIn("重试", updates[-1][0])
+        self.assertIn("视频 URL", updates[-1][0])
+        self.assertIsNone(updates[-1][1].value)
+        self.assertFalse(updates[-1][1].interactive)
+
+    def test_empty_download_url_resets_button_without_network(self):
+        with patch.object(app.VIDEO_CACHE, "get") as get:
+            updates = list(app.prepare_video_download(""))
+        get.assert_not_called()
+        self.assertIsNone(updates[-1][1].value)
+        self.assertFalse(updates[-1][1].interactive)
 
 
 if __name__ == "__main__":
